@@ -1,0 +1,170 @@
+---
+title: "BC Hospitalized Seniors at Risk of Frailty - SPC Analysis"
+author: "Dhanvin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE)
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(DBI)
+library(RSQLite)
+library(qicharts2)
+library(readxl)
+```
+
+## Why this analysis
+
+Health Quality BC's real workflow pulls data from their internal Health Data Platform, filters it with a bit of SQL, then does the actual analysis in R. This notebook mirrors that pattern using a public CIHI indicator (Hospitalized Seniors at Risk of Frailty, derived from DAD data) as a stand-in, since I don't have access to their internal systems.
+
+The question is simple: is BC seeing a real change in hospitalized senior frailty risk over the last ten years, or is this just normal year to year noise. An SPC chart is the right tool for that question, not a significance test, since the goal here is to flag a signal for action rather than prove a generalizable causal claim.
+
+## Reading and cleaning the raw data
+
+The CIHI file marks suppressed small cell values with text codes rather than leaving them blank, so this has to be handled explicitly before anything gets converted to numeric. I also don't fully trust that `clean_names()` will hit the exact column name I expect if CIHI ever tweaks a header, so the script checks for that up front and fails loudly instead of quietly producing a column of NAs.
+
+```{r load-clean}
+file_path <- "C:/Users/dhanv/OneDrive/Desktop/applications/HQBC/senior_frailty/821-hospitalized-seniors-at-risk-of-frailty-data-table-en.xlsx"
+
+raw <- read_excel(file_path, sheet = "Table 1", skip = 1, col_types = "text") %>%
+  clean_names()
+
+target_col_name <- "hospitalized_seniors_at_risk_of_frailty_percent_6_or_more_deficits"
+risk_group_cols <- names(raw)[str_starts(names(raw), "risk_group")]
+
+stopifnot(
+  target_col_name %in% names(raw),
+  "denominator" %in% names(raw),
+  "median_of_deficits" %in% names(raw),
+  length(risk_group_cols) > 0
+)
+
+suppression_pattern <- regex("suppress|^n/?a$|^ns$|^\\*+$|^-+$|^<\\s*\\d+$", ignore_case = TRUE)
+
+bc_frailty <- raw %>%
+  mutate(
+    is_suppressed    = str_detect(str_trim(.data[[target_col_name]]), suppression_pattern),
+    frailty_rate_pct = suppressWarnings(as.numeric(.data[[target_col_name]])),
+    unrecognized     = is.na(frailty_rate_pct) & !is_suppressed & !is.na(.data[[target_col_name]])
+  ) %>%
+  mutate(across(c(denominator, median_of_deficits, all_of(risk_group_cols)),
+                ~ suppressWarnings(as.numeric(.x))))
+
+stopifnot("Unrecognized non-numeric values in target column - inspect before continuing" =
+            sum(bc_frailty$unrecognized) == 0)
+
+bc_frailty <- select(bc_frailty, -unrecognized)
+```
+
+## Extracting the BC provincial subset
+
+I originally planned to compare all six BC health authorities, but the data doesn't support that cleanly. Only Vancouver Coastal Health and PHSA have aggregate level rows in this indicator. Fraser, Interior, Island, and Northern Health only report at the individual facility level, so there's no authority wide number to compare against for four of the six. Facility level rows also carry most of the suppression in this dataset (close to 12 percent, versus zero at the provincial level), so a facility level rollup would have been messy anyway.
+
+Given that, I dropped the authority comparison and used the provincial trend instead, which is clean: zero suppression, one row per fiscal year, ten years of data.
+
+
+```{r extract-subset}
+con <- dbConnect(RSQLite::SQLite(), "frailty.db")
+dbWriteTable(con, "frailty_data", bc_frailty, overwrite = TRUE)
+
+sql_query <- "SELECT
+  time_frame AS fiscal_year,
+  reporting_level,
+  frailty_rate_pct,
+  is_suppressed
+FROM frailty_data
+WHERE province_territory = 'British Columbia'
+  AND reporting_level = 'Province/territory'
+ORDER BY time_frame ASC;
+"
+
+working_subset <- dbGetQuery(con, sql_query)
+
+dbDisconnect(con)
+```
+
+```{r sanity-check}
+nrow(working_subset)
+working_subset %>% summarise(n_suppressed = sum(is_suppressed))
+head(working_subset)
+```
+
+Ten rows, zero suppressed, as expected. There's no denominator available at the provincial level (it's suppressed everywhere except the national rollup), which is why this uses an I-chart rather than a p-chart. A p-chart needs a denominator to model expected variation properly, and I don't have one here.
+
+## Initial SPC analysis
+
+```{r i-chart}
+qic(
+  x = fiscal_year,
+  y = frailty_rate_pct,
+  data = working_subset,
+  chart = "i",
+  title = "BC: Hospitalized Seniors at Risk of Frailty (%)",
+  ylab = "% of seniors at risk of frailty (6+ deficits)",
+  xlab = "Fiscal Year"
+)
+```
+
+Two special cause clusters show up here, not one. Fiscal years 2016-17 through 2019-20 sit below the lower control limit, and 2022-23 through 2024-25 sit above the upper control limit. 2015-16, 2020-21, and 2021-22 fall within limits.
+
+```{r run-chart}
+qic(
+  x = fiscal_year,
+  y = frailty_rate_pct,
+  data = working_subset,
+  chart = "run",
+  title = "BC: Hospitalized Seniors at Risk of Frailty (%)",
+  ylab = "% of seniors at risk of frailty (6+ deficits)",
+  xlab = "Fiscal Year"
+)
+```
+
+```{r run-chart-diagnostics}
+run_result <- qic(x = fiscal_year, y = frailty_rate_pct, data = working_subset, chart = "run")
+run_result$data
+```
+
+I'm not using the run chart's signal flag in the final interpretation. The raw crossings count here is 1 against a minimum threshold of 2, which by the stated rule should trip a signal, but `runs.signal` reads FALSE for every row. I haven't tracked down why the package reports it that way, so I'm treating the I-chart result as the primary evidence and leaving the run chart as a supporting visual only.
+
+## Frozen baseline check
+
+The whole series I-chart above uses all ten points to calculate its control limits, including the points that are themselves flagged as signals. That's a reasonable first pass, but it means the post-2020 rise is being judged partly against limits that the post-2020 rise itself helped set. To check whether that rise is real independent of that effect, I recalculated the centerline and limits using only the five pre-2020 points as a fixed baseline, then plotted all ten points against those fixed limits.
+
+The `fiscal_year` column is text, which threw an NA coercion warning when qic tried to place the baseline marker line on the plot. Switching to a numeric index fixes that without changing any of the underlying calculation.
+
+```{r frozen-baseline}
+working_subset <- working_subset %>%
+  mutate(fy_index = row_number())
+
+freeze_result <- qic(
+  x = fy_index, y = frailty_rate_pct, data = working_subset,
+  chart = "i", freeze = 5,
+  title = "BC: Hospitalized Seniors at Risk of Frailty (%) - Frozen Baseline (Pre-2020)",
+  ylab = "% of seniors at risk of frailty (6+ deficits)", xlab = "Fiscal Year"
+) +
+  scale_x_continuous(breaks = 1:10, labels = working_subset$fiscal_year)
+
+freeze_result
+```
+
+```{r frozen-baseline-values}
+freeze_result$data[, c("x", "y", "cl", "ucl", "lcl", "sigma.signal")]
+```
+
+Against a baseline fixed at CL 23.18, UCL 25.04, LCL 21.32, the signal starts at 2021-22, not 2022-23. That's one fiscal year earlier than what the whole series chart suggested. 2020-21 falls within the frozen limits, close to the centerline, so the disruption doesn't show up immediately in the pandemic year itself. It shows up the year after.
+
+## What this does and doesn't tell us
+
+The post-2021 rise lines up with hospital-associated deconditioning after the disruption to normal care pathways during the pandemic. That part of the story holds up against the data.
+
+The pre-2020 decline doesn't have an obvious explanation tied to COVID, since it starts three to four years before the pandemic reached BC. I don't have a cause for it. It could be a coding or methodology change at CIHI, a genuine pre-pandemic improvement, or something else. I'm flagging it as an open question rather than folding it into a single tidy narrative it doesn't actually support.
+
+Worth stating plainly: this is ten data points, and the frozen baseline uses five of them. Small samples make the moving range based limits less stable than they would be with more history. The provincial level also has no denominator available, so this can't be turned into a rate based p-chart the way I might do if I have fuller access to HDP. And this is signal detection for a quality improvement question, not a research study aiming at a generalizable causal claim.
